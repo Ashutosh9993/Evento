@@ -1,259 +1,176 @@
-const express = require("express");
-const cors = require("cors");
-require("dotenv").config();
-const mongoose = require("mongoose");
-const UserModel = require("./models/User");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const cookieParser = require("cookie-parser");
-const multer = require("multer");
-const path = require("path");
+const express = require('express');
+const cors = require('cors');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
+const multer = require('multer');
+const path = require('path');
+require('dotenv').config();
 
-const Ticket = require("./models/Ticket");
+const UserModel = require('./models/User');
+const Ticket = require('./models/Ticket');
+const Event = require('./models/Event');
 
 const app = express();
+const PORT = process.env.PORT || 4000;
+const MONGO_URL = process.env.MONGO_URL;
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+const BCRYPT_SALT_ROUNDS = 10;
 
-const bcryptSalt = bcrypt.genSaltSync(10);
-const jwtSecret = "bsbsfbrnsftentwnnwnwn";
-
+// middleware
 app.use(express.json());
 app.use(cookieParser());
-app.use(
-   cors({
-      credentials: true,
-      origin: "http://localhost:5173",
-   })
-);
+app.use(cors({
+  credentials: true,
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+}));
 
-mongoose.connect(process.env.MONGO_URL);
-
+// multer configuration
 const storage = multer.diskStorage({
-   destination: (req, file, cb) => {
-      cb(null, "uploads/");
-   },
-   filename: (req, file, cb) => {
-      cb(null, file.originalname);
-   },
+  destination: (req, file, cb) => cb(null, 'uploads/'),
+  filename: (req, file, cb) => cb(null, file.originalname),
 });
-
 const upload = multer({ storage });
 
-app.get("/test", (req, res) => {
-   res.json("test ok");
+// database connection
+mongoose.connect(MONGO_URL)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+const generateToken = (user) => {
+  return jwt.sign({ id: user._id, email: user.email }, JWT_SECRET, { expiresIn: '1d' });
+};
+
+const verifyToken = (req, res, next) => {
+  const token = req.cookies.token;
+  if (!token) return res.status(401).json({ error: 'Access denied' });
+
+  try {
+    const verified = jwt.verify(token, JWT_SECRET);
+    req.user = verified;
+    next();
+  } catch (err) {
+    res.status(400).json({ error: 'Invalid token' });
+  }
+};
+
+// routes
+app.get('/test', (req, res) => res.json({ message: 'Test OK' }));
+
+app.post('/register', async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+    const userDoc = await UserModel.create({ name, email, password: hashedPassword });
+    res.status(201).json(userDoc);
+  } catch (error) {
+    res.status(422).json({ error: error.message });
+  }
 });
 
-app.post("/register", async (req, res) => {
-   const { name, email, password } = req.body;
+app.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await UserModel.findOne({ email });
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-   try {
-      const userDoc = await UserModel.create({
-         name,
-         email,
-         password: bcrypt.hashSync(password, bcryptSalt),
-      });
-      res.json(userDoc);
-   } catch (e) {
-      res.status(422).json(e);
-   }
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) return res.status(401).json({ error: 'Invalid password' });
+
+    const token = generateToken(user);
+    res.cookie('token', token, { httpOnly: true }).json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post("/login", async (req, res) => {
-   const { email, password } = req.body;
-
-   const userDoc = await UserModel.findOne({ email });
-
-   if (!userDoc) {
-      return res.status(404).json({ error: "User not found" });
-   }
-
-   const passOk = bcrypt.compareSync(password, userDoc.password);
-   if (!passOk) {
-      return res.status(401).json({ error: "Invalid password" });
-   }
-
-   jwt.sign(
-      {
-         email: userDoc.email,
-         id: userDoc._id,
-      },
-      jwtSecret,
-      {},
-      (err, token) => {
-         if (err) {
-            return res.status(500).json({ error: "Failed to generate token" });
-         }
-         res.cookie("token", token).json(userDoc);
-      }
-   );
+app.get('/profile', verifyToken, async (req, res) => {
+  try {
+    const user = await UserModel.findById(req.user.id).select('-password');
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get("/profile", (req, res) => {
-   const { token } = req.cookies;
-   if (token) {
-      jwt.verify(token, jwtSecret, {}, async (err, userData) => {
-         if (err) throw err;
-         const { name, email, _id } = await UserModel.findById(userData.id);
-         res.json({ name, email, _id });
-      });
-   } else {
-      res.json(null);
-   }
+app.post('/logout', (req, res) => {
+  res.clearCookie('token').json({ message: 'Logged out successfully' });
 });
 
-app.post("/logout", (req, res) => {
-   res.cookie("token", "").json(true);
+app.post('/createEvent', verifyToken, upload.single('image'), async (req, res) => {
+  try {
+    const eventData = { ...req.body, image: req.file ? req.file.path : '', owner: req.user.id };
+    const newEvent = await Event.create(eventData);
+    res.status(201).json(newEvent);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-const eventSchema = new mongoose.Schema({
-   owner: String,
-   title: String,
-   description: String,
-   organizedBy: String,
-   eventDate: Date,
-   eventTime: String,
-   location: String,
-   Participants: Number,
-   Count: Number,
-   Income: Number,
-   ticketPrice: Number,
-   Quantity: Number,
-   image: String,
-   likes: Number,
-   Comment: [String],
+app.get('/events', async (req, res) => {
+  try {
+    const events = await Event.find();
+    res.json(events);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-const Event = mongoose.model("Event", eventSchema);
-
-app.post("/createEvent", upload.single("image"), async (req, res) => {
-   try {
-      const eventData = req.body;
-      eventData.image = req.file ? req.file.path : "";
-      const newEvent = new Event(eventData);
-      await newEvent.save();
-      res.status(201).json(newEvent);
-   } catch (error) {
-      res.status(500).json({ error: "Failed to save the event to MongoDB" });
-   }
+app.get('/event/:id', async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id);
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+    res.json(event);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get("/createEvent", async (req, res) => {
-   try {
-      const events = await Event.find();
-      res.status(200).json(events);
-   } catch (error) {
-      res.status(500).json({ error: "Failed to fetch events from MongoDB" });
-   }
+app.post('/event/:eventId/like', verifyToken, async (req, res) => {
+  try {
+    const event = await Event.findByIdAndUpdate(
+      req.params.eventId,
+      { $inc: { likes: 1 } },
+      { new: true }
+    );
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+    res.json(event);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get("/event/:id", async (req, res) => {
-   const { id } = req.params;
-   try {
-      const event = await Event.findById(id);
-      res.json(event);
-   } catch (error) {
-      res.status(500).json({ error: "Failed to fetch event from MongoDB" });
-   }
+app.post('/tickets', verifyToken, async (req, res) => {
+  try {
+    const ticketDetails = { ...req.body, userId: req.user.id };
+    const newTicket = await Ticket.create(ticketDetails);
+    res.status(201).json(newTicket);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post("/event/:eventId", (req, res) => {
-   const eventId = req.params.eventId;
-
-   Event.findById(eventId)
-      .then((event) => {
-         if (!event) {
-            return res.status(404).json({ message: "Event not found" });
-         }
-
-         event.likes += 1;
-         return event.save();
-      })
-      .then((updatedEvent) => {
-         res.json(updatedEvent);
-      })
-      .catch((error) => {
-         console.error("Error liking the event:", error);
-         res.status(500).json({ message: "Server error" });
-      });
+app.get('/tickets/user', verifyToken, async (req, res) => {
+  try {
+    const tickets = await Ticket.find({ userId: req.user.id });
+    res.json(tickets);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get("/events", (req, res) => {
-   Event.find()
-      .then((events) => {
-         res.json(events);
-      })
-      .catch((error) => {
-         console.error("Error fetching events:", error);
-         res.status(500).json({ message: "Server error" });
-      });
+app.delete('/tickets/:id', verifyToken, async (req, res) => {
+  try {
+    const ticket = await Ticket.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found or unauthorized' });
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get("/event/:id/ordersummary", async (req, res) => {
-   const { id } = req.params;
-   try {
-      const event = await Event.findById(id);
-      res.json(event);
-   } catch (error) {
-      res.status(500).json({ error: "Failed to fetch event from MongoDB" });
-   }
-});
-
-app.get("/event/:id/ordersummary/paymentsummary", async (req, res) => {
-   const { id } = req.params;
-   try {
-      const event = await Event.findById(id);
-      res.json(event);
-   } catch (error) {
-      res.status(500).json({ error: "Failed to fetch event from MongoDB" });
-   }
-});
-
-app.post("/tickets", async (req, res) => {
-   try {
-      const ticketDetails = req.body;
-      const newTicket = new Ticket(ticketDetails);
-      await newTicket.save();
-      return res.status(201).json({ ticket: newTicket });
-   } catch (error) {
-      console.error("Error creating ticket:", error);
-      return res.status(500).json({ error: "Failed to create ticket" });
-   }
-});
-
-app.get("/tickets/:id", async (req, res) => {
-   try {
-      const tickets = await Ticket.find();
-      res.json(tickets);
-   } catch (error) {
-      console.error("Error fetching tickets:", error);
-      res.status(500).json({ error: "Failed to fetch tickets" });
-   }
-});
-
-app.get("/tickets/user/:userId", (req, res) => {
-   const userId = req.params.userId;
-
-   Ticket.find({ userid: userId })
-      .then((tickets) => {
-         res.json(tickets);
-      })
-      .catch((error) => {
-         console.error("Error fetching user tickets:", error);
-         res.status(500).json({ error: "Failed to fetch user tickets" });
-      });
-});
-
-app.delete("/tickets/:id", async (req, res) => {
-   try {
-      const ticketId = req.params.id;
-      await Ticket.findByIdAndDelete(ticketId);
-      res.status(204).send();
-   } catch (error) {
-      console.error("Error deleting ticket:", error);
-      res.status(500).json({ error: "Failed to delete ticket" });
-   }
-});
-
-const PORT = process.env.PORT || 4000;
+// start krdo
 app.listen(PORT, () => {
-   console.log(`Server is running on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
